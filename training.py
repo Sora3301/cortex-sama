@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim
 
 class CNNBackbone(nn.Module):
     def __init__(self):
@@ -43,7 +44,7 @@ class FingerHead(nn.Module):
         self.type_head = nn.Linear(hidden, n_slots * n_types)  # 每槽位 type logits
         self.coord_head = nn.Sequential(
             nn.Linear(2 * hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 2),
+            nn.Linear(hidden, 2),nn.Tanh()
         )
         self.type_emb = nn.Embedding(n_types, hidden)   # type 种类 -> 向量
         self.slot_emb = nn.Embedding(n_slots, hidden)   # 槽位身份 -> 向量
@@ -58,7 +59,7 @@ class FingerHead(nn.Module):
         cond = w @ self.type_emb.weight + self.slot_emb(slot)         # (B,4,hidden)
 
         feat = h.unsqueeze(1).expand(-1, self.n_slots, -1)            # (B,4,hidden)
-        coords = torch.tanh(self.coord_head(torch.cat([feat, cond], dim=-1)))  # (B,4,2)
+        coords = self.coord_head(torch.cat([feat, cond], dim=-1))  # (B,4,2)
         return logits, coords
 
     def forward(self, x, B, T):                         # x: (B*T, 256, H, W)
