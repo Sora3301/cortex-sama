@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+import numpy as np
+from decord import VideoReader, gpu
+
 
 class CNNBackbone(nn.Module):
     def __init__(self):
@@ -121,3 +126,22 @@ def train(model, loader, epochs=50, lr=1e-3, coord_w=1.0, device="cpu"):
             total += loss.item() * x.size(0)
 
         print(f"epoch {epoch:3d}  loss {total / len(loader.dataset):.4f}")
+
+class MapDataset(Dataset):
+    def __init__(self, x, type_label, coord_label):
+        self.x = x
+        self.type_label = type_label
+        self.coord_label = coord_label
+
+    def __len__(self):
+        return len(self.x)
+    
+    def __getitem__(self, index):
+        return self.x[index], self.type_label[index], self.coord_label[index]
+    
+class MapDataloader:
+    def loadVedio(self):
+        vr = VideoReader("", ctx = gpu(0))
+        all_frames = vr[:].asnumpy()
+
+    
