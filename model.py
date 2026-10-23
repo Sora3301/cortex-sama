@@ -70,17 +70,6 @@ class FingerHead(nn.Module):
         logits = logits.view(B, T, self.n_slots, self.n_types)   # (B,T,4,n_types)
         coords = coords.view(B, T, self.n_slots, 2)              # (B,T,4,2)
         return logits, coords, h
-    '''
-    def step(self, x, h=None):                          # x: (B, 256, H, W) 单帧
-        B = x.size(0)
-        if h is None:                                   # 序列开头, h 置零
-            h = torch.zeros(self.gru.num_layers, B, self.gru.hidden_size, device=x.device)
-        g = F.adaptive_max_pool2d(x, 1).flatten(1)      # (B, 256)
-        out, h = self.gru(g.unsqueeze(1), h)            # (B,1,gru_hidden), 新 h
-        logits, coords = self._predict(self.trunk(out[:, 0]), x.device)
-        return logits, coords, h                         # 把新 h 传给下一步
-    '''
-
 
 class Model(nn.Module):
     def __init__(self):
@@ -89,6 +78,8 @@ class Model(nn.Module):
         self.head = FingerHead()
 
     def _forward(self, x, h=None):               # x: (B, T, 3, H, W)
+        if x.dim() == 4:                        # 若传入单帧 (B, 3, H, W)，自动扩成 T=1
+            x = x.unsqueeze(1)
         B, T = x.shape[:2]
         f = self.backbone(x.flatten(0, 1))      # (B*T, 256, h, w)
         return self.head(f, B, T, h)
