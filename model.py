@@ -1,3 +1,36 @@
+"""
+model.py —— 视觉特征提取与多指时序预测模型
+
+本文件需要实现的内容：
+1. 动作类型常量定义（可选，也可放在公共处）：
+   - TYPE_IDLE  = 0  # 空置
+   - TYPE_DOWN  = 1  # 新按下 (click / drag / hold 起始帧)
+   - TYPE_HOLD  = 2  # 持续按住或移动 (hold / drag 后续帧)
+   - TYPE_FLICK = 3  # 划动音符起始帧 (flick)
+
+2. CNNBackbone(nn.Module) —— 单帧视觉特征提取主干：
+   - 输入: (B*T, 3, H, W) 归一化到 [0, 1] 的 RGB 图像张量
+   - 结构: 5 层 stride=2 的 Conv2d + ReLU (3 -> 32 -> 64 -> 128 -> 128 -> 256)
+   - 输出: (B*T, 256, h, w) 特征图
+
+3. FingerHead(nn.Module) —— GRU 时序记忆 + 多指槽位预测头：
+   - 输入: CNN 特征 x (B*T, 256, h, w)、批大小 B、时间步 T、可选隐藏状态 h (1, B, gru_hidden)
+   - 处理流程:
+     a) 空间池化压平为 (B, T, 256)，送入单向 GRU 得到时序特征 out 和新隐藏状态 h
+     b) 经过 trunk (MLP) 提取每帧隐藏表示 f (B*T, hidden)
+     c) type_head 预测每个槽位的动作类别打分 logits: (B, T, n_slots, n_types)
+     d) 用 logits.softmax(-1) 加权 type_emb，加上 slot_emb，与 f 拼接后经 coord_head + Tanh
+        预测每个槽位的归一化坐标 coords: (B, T, n_slots, 2) ∈ [-1, 1]
+   - 输出: (logits, coords, h)
+
+4. Model(nn.Module) —— 完整模型封装：
+   - 组合 CNNBackbone 与 FingerHead
+   - forward(x, warmup=None, h=None):
+     a) 若传入 h，直接接着 h 跑 _forward(x, h)（用于流式推理）
+     b) 若传入 warmup，先在 torch.no_grad() 下跑 _forward(warmup) 拿到预热状态 h，再跑 _forward(x, h)
+     c) 支持 5 维序列输入 (B, T, 3, H, W) 及 4 维单帧输入 (B, 3, H, W)
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
