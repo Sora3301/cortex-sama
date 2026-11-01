@@ -34,6 +34,7 @@ model.py —— 视觉特征提取与多指时序预测模型
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import config as C
 
 class CNNBackbone(nn.Module):
     def __init__(self):
@@ -53,7 +54,7 @@ class CNNBackbone(nn.Module):
         return f5
 
 class FingerHead(nn.Module):
-    def __init__(self, in_ch=256, hidden=128, gru_hidden=256, n_slots=4, n_types=4):
+    def __init__(self, in_ch=256, hidden=128, gru_hidden=256, n_slots=C.n_slot, n_types=4):
         super().__init__()
         self.n_slots = n_slots
         self.n_types = n_types

@@ -1,6 +1,7 @@
 #  常量
 from enum import Enum
 
+n_slot = 4
 # 槽位动作类别定义 (n_types = 4)
 class Action_type(Enum):
     TYPE_IDLE = 0   # 空置
