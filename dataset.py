@@ -72,7 +72,7 @@ def parse_finger_jsonl(jsonl_path):
                 frame_id = obj["frame"]
                 record[frame_id] = obj
                 frame_num = frame_id
-    frame_label_list = [Frame_teacher()]
+    frame_label_list: list[Frame_teacher] = []
     for i in range(frame_num + 1):
         frame_label = Frame_teacher()
         if i in record:
@@ -80,7 +80,7 @@ def parse_finger_jsonl(jsonl_path):
             for e in events:
                 if e.get("bad"): continue
                 slot_label = Coordf_with_type(jsonPhase_to_ActionType(e["phase"]), float(e["x"]), float(e["y"]))
-                if abs(slot_label.x) > 1.0 or abs(slot_label.x) > 1.0: continue
+                if abs(slot_label.x) > 1.0 or abs(slot_label.y) > 1.0: continue
                 frame_label.slot.append(slot_label)
             #排序
             frame_label.slot.sort(
