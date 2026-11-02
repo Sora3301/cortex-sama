@@ -32,11 +32,12 @@ train.py —— 损失函数、训练/验证循环与程序入口
     - 实例化 model.py 中的 Model()，调用 train_trunks 开始训练
 """
 
-from sympy import true
-from torch.utils.data import DataLoader
+from typing import Any
+
 import torch
-import torch.optim
 import torch.nn.functional as F
+import torch.optim
+from torch.utils.data import DataLoader
 
 import config as C
 import model as M
@@ -45,32 +46,41 @@ from config import Action_type as Action_type
 
 # 损失函数
 # 如果id持续绑定槽位，可能需要匹配手指的编号（未实现）
-def compute_loss(logits, coords, type_label, coord_label, coord_w=1.0, class_weights=None):
+def compute_loss(
+    logits: torch.Tensor,
+    coords: torch.Tensor,
+    type_label: torch.Tensor,
+    coord_label: torch.Tensor,
+    coord_w: float = 1.0,
+    class_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     n_types = logits.size(-1)
     type_loss = F.cross_entropy(
         logits.reshape(-1, n_types),
         type_label.reshape(-1),
         weight = class_weights
     )
-    active_mask = type_label > Action_type.TYPE_IDLE
+    active_mask = type_label > Action_type.TYPE_IDLE.value
     if active_mask.any():
         coord_loss = F.mse_loss(coords[active_mask], coord_label[active_mask])
     else:
         coord_loss = coords.sum() * 0.0
     
-    loss = type_loss + C.class_weight * coord_loss
+    loss = type_loss + coord_w * coord_loss
     return loss, type_loss, coord_loss
 
 def evaluate(
-    model, 
-    val_loader, 
-    coord_w=2.0, 
-    class_weights=None, 
-    device="cpu"
-):
+    model: M.Model,
+    val_loader: DataLoader[Any],
+    coord_w: float = 2.0,
+    device: str = "cpu",
+) -> None:
     val_loss = 0.0
     total_loss = 0.0
     epoch_size = 0
+    class_weights = torch.tensor(
+        C.class_weight, dtype=torch.float32, device=device
+    )
     for warmup, x, type_label, coord_label in val_loader:
         warmup = warmup.to(device, non_blocking = True)
         x = x.to(device, non_blocking = True)
@@ -78,7 +88,7 @@ def evaluate(
         coord_label = coord_label.to(device, non_blocking = True)
 
         logits, coords, h = model(x, warmup)
-        loss, _, _ = compute_loss(logits, coords, type_label, coord_label, coord_w, C.class_weight)
+        loss, _, _ = compute_loss(logits, coords, type_label, coord_label, coord_w, class_weights)
 
         bs = x.size(0) # batch_size可能不同，每个样本帧数必定相同
         total_loss += loss.item() * bs
@@ -92,18 +102,20 @@ def evaluate(
 
 
 def train_chunks(
-    model,
-    train_loader,       # 训练集数据加载器
-    epochs=20,
-    lr=1e-3,
-    coord_w=C.coord_w,
-    device="cpu",
-    save_dir="checkpoints",
-    log_interval=20,
-):
+    model: M.Model,
+    train_loader: DataLoader[Any],       # 训练集数据加载器
+    epochs: int = 20,
+    lr: float = 1e-3,
+    coord_w: float = C.coord_w,
+    device: str = "cpu",
+    save_dir: str = "checkpoints",
+    log_interval: int = 20,
+) -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-
-    for i in (0, epochs):
+    class_weights = torch.tensor(
+        C.class_weight, dtype=torch.float32, device=device
+    )
+    for i in range(1, epochs + 1):
         step_idx = 0
         total_loss = 0.0
         epoch_size = 0
@@ -115,7 +127,7 @@ def train_chunks(
             coord_label = coord_label.to(device, non_blocking = True)
 
             logits, coords, h = model(x, warmup)
-            loss, _, _ = compute_loss(logits, coords, type_label, coord_label, coord_w, C.class_weight)
+            loss, _, _ = compute_loss(logits, coords, type_label, coord_label, coord_w, class_weights)
 
             opt.zero_grad()
             loss.backward()
@@ -140,8 +152,8 @@ def train_chunks(
 
 
 
-def main():
-    train_loader = DataLoader(
+def main() -> None:
+    train_loader: DataLoader[Any] = DataLoader(
         train_dataset,
         batch_size=C.batch_size,
         shuffle=True,
@@ -149,7 +161,7 @@ def main():
         pin_memory=C.pin_memory
 
     )
-    val_loader = DataLoader(
+    val_loader: DataLoader[Any] = DataLoader(
         val_dataset,
         batch_size=C.batch_size,
         shuffle=True,
@@ -170,9 +182,8 @@ def main():
     evaluate(
         model,
         val_loader,
-        coord_w = C.coord_w,
-        class_weights = C.class_weight,
-        device = 'cuda'
+        coord_w=C.coord_w,
+        device='cuda',
     )
     return
 
