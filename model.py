@@ -45,7 +45,7 @@ class CNNBackbone(nn.Module):
         self.conv4 = nn.Conv2d(128, 128, 3, 2, 1)
         self.conv5 = nn.Conv2d(128, 256, 3, 2, 1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
@@ -54,7 +54,14 @@ class CNNBackbone(nn.Module):
         return f5
 
 class FingerHead(nn.Module):
-    def __init__(self, in_ch=256, hidden=128, gru_hidden=256, n_slots=C.n_slot, n_types=4):
+    def __init__(
+        self,
+        in_ch: int = 256,
+        hidden: int = 128,
+        gru_hidden: int = 256,
+        n_slots: int = C.n_slot,
+        n_types: int = 4,
+    ) -> None:
         super().__init__()
         self.n_slots = n_slots
         self.n_types = n_types
@@ -82,7 +89,11 @@ class FingerHead(nn.Module):
         self.type_emb = nn.Embedding(n_types, hidden)   # type 种类 -> 向量
         self.slot_emb = nn.Embedding(n_slots, hidden)   # 槽位身份 -> 向量
 
-    def _predict(self, h, device):
+    def _predict(
+        self,
+        h: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         B = h.size(0)
         logits = self.type_head(h).view(B, self.n_slots, self.n_types)  # (B,4,n_types)
 
@@ -95,7 +106,14 @@ class FingerHead(nn.Module):
         coords = self.coord_head(torch.cat([feat, cond], dim=-1))  # (B,4,2)
         return logits, coords
 
-    def forward(self, x, B, T, h=None):                 # x: (B*T, 256, H, W), h: (num_layers,B,gru_hidden)
+    def forward(
+        self,
+        x: torch.Tensor,
+        B: int,
+        T: int,
+        h: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x: (B*T, 256, H, W), h: (num_layers, B, gru_hidden)
         g = F.adaptive_max_pool2d(x, 1).flatten(1)      # (B*T, 256) 全局 map
         g = g.reshape(B, T, -1)                         # (B, T, 256) 按时间排好
         out, h = self.gru(g, h)                         # (B, T, gru_hidden)，h 传入传出实现跨块续接
@@ -111,14 +129,24 @@ class Model(nn.Module):
         self.backbone = CNNBackbone()
         self.head = FingerHead()
 
-    def _forward(self, x, h=None):               # x: (B, T, 3, H, W)
+    def _forward(
+        self,
+        x: torch.Tensor,
+        h: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x: (B, T, 3, H, W)
         if x.dim() == 4:                        # 若传入单帧 (B, 3, H, W)，自动扩成 T=1
             x = x.unsqueeze(1)
         B, T = x.shape[:2]
         f = self.backbone(x.flatten(0, 1))      # (B*T, 256, h, w)
         return self.head(f, B, T, h)
 
-    def forward(self, x, warmup=None, h=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        warmup: torch.Tensor | None = None,
+        h: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if h is not None:
             return self._forward(x, h) 
         if warmup is not None and warmup.size(1) > 0:
