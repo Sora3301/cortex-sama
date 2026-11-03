@@ -13,7 +13,8 @@ dataset.py —— 数据扫描、事件流解析、视频帧读取与 PyTorch Da
      - 帧内按 (x, y, type) 排序，保证同一幅画面的标签唯一确定
 4. VideoChunkDataset(Dataset) —— 滑窗视频块数据集（待实现）
 """
-
+from typing import Literal
+import os
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,6 +24,8 @@ from torch.utils.data import DataLoader, Dataset
 
 import config as C
 from config import Action_type as Action_type
+
+
 
 
 @dataclass
@@ -39,6 +42,9 @@ class Frame_teacher:
     def isOverSlot(self) -> bool:
         return len(self.slot) > C.n_slot
 
+    def getSlot(self) -> int:
+        return len(self.slot)
+
 
 def jsonPhase_to_ActionType(phase: str) -> Action_type:
     if phase == "down":
@@ -49,6 +55,31 @@ def jsonPhase_to_ActionType(phase: str) -> Action_type:
         return Action_type.TYPE_FLICK
     else:
         return Action_type.TYPE_IDLE
+
+def parse_map_info(
+    vedio_name: str # 带扩展名
+) -> tuple[Literal[-1], Literal[-1]] | tuple[Any, Any]:
+    with open(C.label_path + "/manifast.json", encoding="utf-8") as F:
+        data = json.load(F)
+        target = next((obj for obj in data if obj.get("folder") == os.path.splitext(vedio_name)), None)
+    
+    if target is not None:
+        return int(target["num_frames"]), int(target["max_slots"])
+    else:
+        print("没找到", vedio_name, "喵")
+        return -1, -1
+
+def count_max_slot(
+    label:list[Frame_teacher],
+    start:int,
+    end:int = -1
+):
+    if end < 0: end = start + C.seq_len
+    max_slot = 0
+    end = min(end, len(label))
+    for i in range(start, end):
+        max_slot = max(max_slot, label[i].getSlot())
+    return max_slot
 
 
 def parse_finger_jsonl(
