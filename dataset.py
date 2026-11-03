@@ -13,7 +13,7 @@ dataset.py —— 数据扫描、事件流解析、视频帧读取与 PyTorch Da
      - 帧内按 (x, y, type) 排序，保证同一幅画面的标签唯一确定
 4. VideoChunkDataset(Dataset) —— 滑窗视频块数据集（待实现）
 """
-
+import os
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,6 +23,8 @@ from torch.utils.data import DataLoader, Dataset
 
 import config as C
 from config import Action_type as Action_type
+
+
 
 
 @dataclass
@@ -50,6 +52,17 @@ def jsonPhase_to_ActionType(phase: str) -> Action_type:
     else:
         return Action_type.TYPE_IDLE
 
+def parse_map_info(
+    vedio_name: str
+) -> tuple[Any, Any] | None:
+    with open(C.label_path + "/manifast.json", encoding="utf-8") as F:
+        data = json.load(F)
+        target = next((obj for obj in data if obj.get("folder") == os.path.splitext(vedio_name)), None)
+    
+    if target is not None:
+        return target["num_frames"], target["max_slots"]
+    else:
+        print("没找到谱面喵")
 
 def parse_finger_jsonl(
     jsonl_path: str,
