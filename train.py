@@ -74,20 +74,26 @@ def compute_loss(
     loss = type_loss + coord_w * coord_loss
     return loss, type_loss, coord_loss
 
+@torch.no_grad()
 def evaluate(
     model: M.Model,
     val_loader: DataLoader[Any],
     coord_w: float = 2.0,
     device: str = C.device,
-) -> None:
-    val_loss = 0.0
-    total_loss = 0.0
-    total_type_loss = 0.0
-    total_coord_loss = 0.0
-    epoch_size = 0
+    class_weights: torch.Tensor | None = None,
+) -> dict[str, float]:
     class_weights = torch.tensor(
         C.class_weight, dtype=torch.float32, device=device
     )
+    model.eval()
+    total_loss = 0.0
+    total_type_loss = 0.0
+    total_coord_loss = 0.0
+    total_correct = 0
+    total_slots = 0
+    total_coord_err = 0.0
+    total_active_coords = 0
+    epoch_size = 0
     for warmup, x, type_label, coord_label in val_loader:
         warmup = warmup.to(device, non_blocking = True)
         x = x.to(device, non_blocking = True)
@@ -95,24 +101,50 @@ def evaluate(
         coord_label = coord_label.to(device, non_blocking = True)
 
         logits, coords, h = model(x, warmup)
-        loss, _, _ = compute_loss(logits, coords, type_label, coord_label, coord_w, class_weights)
+        loss, type_loss, coord_loss = compute_loss(
+            logits, coords, type_label, coord_label, coord_w, class_weights
+        )
 
         bs = x.size(0) # batch_size可能不同，每个样本帧数必定相同
         total_loss += loss.item() * bs
+        total_type_loss += type_loss.item() * bs
+        total_coord_loss += coord_loss.item() * bs
         epoch_size += bs
 
-    val_loss = total_loss / epoch_size
-    avg_type_loss = total_type_loss / epoch_size
-    avg_coord_loss = total_coord_loss / epoch_size
+        total_correct += (logits.argmax(-1) == type_label).sum().item()
+        total_slots += type_label.numel()
+
+        active_mask = type_label > Action_type.TYPE_IDLE.value
+        total_coord_err += (
+            coords[active_mask] - coord_label[active_mask]
+        ).abs().sum().item()
+        total_active_coords += active_mask.sum().item() * coords.size(-1)
+
+    metrics = {
+        "loss": total_loss / epoch_size,
+        "type_loss": total_type_loss / epoch_size,
+        "coord_loss": total_coord_loss / epoch_size,
+        "acc": total_correct / total_slots if total_slots else 0.0,
+        "coord_mae": (
+            total_coord_err / total_active_coords
+            if total_active_coords else 0.0
+        ),
+    }
     print(
         f" evaluate:"
-        f" average_loss = {val_loss:.4f} type_loss={avg_type_loss:.4f} coord_loss={avg_coord_loss:.4f}"
+        f" average_loss = {metrics['loss']:.4f}"
+        f" type_loss={metrics['type_loss']:.4f}"
+        f" coord_loss={metrics['coord_loss']:.4f}"
+        f" acc={metrics['acc']:.4f}"
+        f" coord_mae={metrics['coord_mae']:.4f}"
     )
+    return metrics
 
 
 def train_chunks(
     model: M.Model,
     train_loader: DataLoader[Any],       # 训练集数据加载器
+    val_loader: DataLoader[Any] | None = None,  # 验证集数据加载器（可选）
     epochs: int = 20,
     lr: float = 1e-3,
     coord_w: float = C.coord_w,
@@ -120,11 +152,16 @@ def train_chunks(
     save_dir: str = C.save_dir,
     log_interval: int = 20,
 ) -> None:
+    model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     class_weights = torch.tensor(
         C.class_weight, dtype=torch.float32, device=device
     )
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    best_val_loss = float("inf")
     for i in range(1, epochs + 1):
+        model.train()
         step_idx = 0
         total_loss = 0.0
         total_type_loss = 0.0
@@ -165,6 +202,23 @@ def train_chunks(
             f" [Epoch {i:03d} / {epochs:03d}]"
             f" average_loss = {avg_loss:.4f} type_loss={avg_type_loss:.4f} coord_loss={avg_coord_loss:.4f}"
         )
+
+        # 每轮都保存最新权重；有验证集时按验证 loss 另存最优权重
+        torch.save(model.state_dict(), save_path / "last.pt")
+        print(f"  saved last: {save_path / 'last.pt'}")
+
+        if val_loader is not None:
+            metrics = evaluate(
+                model, val_loader, coord_w, device, class_weights
+            )
+            if metrics["loss"] < best_val_loss:
+                best_val_loss = metrics["loss"]
+                torch.save(model.state_dict(), save_path / "best.pt")
+                print(
+                    f"  saved best: {save_path / 'best.pt'}"
+                    f" (val_loss={best_val_loss:.4f})"
+                )
+            model.train()   # evaluate 内部切到了 eval，这里切回训练模式
 
 @dataclass
 class DataPair:
