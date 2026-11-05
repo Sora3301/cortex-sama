@@ -1,6 +1,10 @@
 #  常量
 from enum import IntEnum
 
+# 路径
+label_path = "../map-set-labels"
+vedio_path = "../map-set-vedio"
+
 n_slot: int = 4
 # 槽位动作类别定义 (n_types = 4)
 class Action_type(IntEnum):
@@ -14,7 +18,15 @@ class_weight: list[float] = [0.1, 1.0, 2.0, 4.0]          # 四种note的权重
 
 num_threads: int = 6
 batch_size: int = 16     # cpu视频解码
+device = "cuda"
 pin_memory: bool = True
+
+save_dir: str = "checkpoints"
 
 seq_len: int = 16
 warmup_len: int = 16
+
+p_empty_chunk = 0.1 # 空chunk保留的概率
+
+n_train = 100
+n_test = 20
