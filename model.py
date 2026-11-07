@@ -17,7 +17,7 @@ model.py —— 视觉特征提取与多指时序预测模型
     - 输入: CNN 特征 x (B*T, 256, h, w)、批大小 B、时间步 T、可选隐藏状态 h (1, B, gru_hidden)
     - 处理流程:
         a) 空间池化压平为 (B, T, 256)，送入单向 GRU 得到时序特征 out 和新隐藏状态 h
-        b) 经过 trunk (MLP) 提取每帧隐藏表示 f (B*T, hidden)
+        b) 经过 chunk (MLP) 提取每帧隐藏表示 f (B*T, hidden)
         c) type_head 预测每个槽位的动作类别打分 logits: (B, T, n_slots, n_types)
         d) 用 logits.softmax(-1) 加权 type_emb，加上 slot_emb，与 f 拼接后经 coord_head + Tanh
         预测每个槽位的归一化坐标 coords: (B, T, n_slots, 2) ∈ [-1, 1]
@@ -73,7 +73,7 @@ class FingerHead(nn.Module):
             batch_first=True,
             bidirectional=False,
         )
-        self.trunk = nn.Sequential(
+        self.chunk = nn.Sequential(
             nn.Linear(gru_hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
@@ -117,7 +117,7 @@ class FingerHead(nn.Module):
         g = F.adaptive_max_pool2d(x, 1).flatten(1)      # (B*T, 256) 全局 map
         g = g.reshape(B, T, -1)                         # (B, T, 256) 按时间排好
         out, h = self.gru(g, h)                         # (B, T, gru_hidden)，h 传入传出实现跨块续接
-        f = self.trunk(out.reshape(B * T, -1))          # (B*T, hidden) 每帧都过 trunk
+        f = self.chunk(out.reshape(B * T, -1))          # (B*T, hidden) 每帧都过 chunk
         logits, coords = self._predict(f, x.device)     # (B*T,4,n_types), (B*T,4,2)
         logits = logits.view(B, T, self.n_slots, self.n_types)   # (B,T,4,n_types)
         coords = coords.view(B, T, self.n_slots, 2)              # (B,T,4,2)
