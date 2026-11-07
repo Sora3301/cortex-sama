@@ -14,12 +14,12 @@ dataset.py —— 数据扫描、事件流解析、视频帧读取与 PyTorch Da
 4. VideoChunkDataset(Dataset) —— 滑窗视频块数据集（待实现）
 """
 import json
+import math
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 import config as C
 from config import Action_type as Action_type
@@ -98,6 +98,8 @@ def parse_finger_jsonl(
                 x = float(e["x"])
                 y = float(e["y"])
                 slot_label = Coordf_with_type(jsonPhase_to_ActionType(e["phase"]), x, y)
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue
                 if abs(x) > 1.0 or abs(y) > 1.0:
                     continue
                 frame_label.slot.append(slot_label)
@@ -112,7 +114,7 @@ def parse_finger_jsonl(
 class VideoChunkDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
-        vedio: list[str],
+        video: list[str],
         teaching_data: list[list[Frame_teacher]],
         start: list[int],
         T: int, # chunk大小

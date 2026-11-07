@@ -6,8 +6,8 @@ train.py —— 损失函数、训练/验证循环与程序入口
     - 动作分类损失 type_loss:
         使用 F.cross_entropy(logits.reshape(-1, n_types), type_label.reshape(-1), weight=class_weights)
     - 坐标回归损失 coord_loss:
-        构造活跃掩码 active_mask = (type_label > 0)，仅对非空置槽位计算 F.mse_loss(coords[active_mask], coord_label[active_mask])；
-        若 active_mask.any() 为 False，则 coord_loss 置为 0
+        构造活跃掩码 active_mask = (type_label > 0)，仅对非空置槽位计算 masked MSE；
+        若没有活跃槽位，则 coord_loss 置为 0
     - 返回总损失 loss = type_loss + coord_w * coord_loss（以及分项 loss 便于打印日志）
 
 2. evaluate(model, val_loader, coord_w=2.0, class_weights=None, device="cpu") —— 验证集评估（可选但推荐）：
@@ -23,20 +23,21 @@ train.py —— 损失函数、训练/验证循环与程序入口
         c) 前向传播: logits, coords, _ = model(x, warmup=warmup)
         d) 计算损失: loss = compute_loss(...)
         e) 反向传播与参数更新: opt.zero_grad() -> loss.backward() -> opt.step()
-        f) 累加 total_loss += loss.item() * bs 与样本数 epoch_size += bs，每隔 log_interval 步打印进度
+        f) 在 GPU 上累加 total_type_loss / total_coord_loss，每隔 log_interval 步再转 Python 打印进度
         g) 每轮结束后（可选跑 evaluate 验证）保存模型权重 torch.save(..., "last.pt" / "best.pt")
 
 4. main() —— 组装与启动入口：
     - 调用 dataset.py 中的 discover_recordings 和 build_dataset_index 准备训练/验证数据
     - 实例化 VideoChunkDataset 并用 DataLoader 包装成 train_loader 和 val_loader
-    - 实例化 model.py 中的 Model()，调用 train_trunks 开始训练
+    - 实例化 model.py 中的 Model()，调用 train_chunks 开始训练
 """
 
 import torch
 import torch.nn.functional as F
-import torch.optim
+import torch.optim, torch.cuda
 from torch.utils.data import DataLoader
 
+import csv
 import json
 import random
 from dataclasses import dataclass
@@ -56,9 +57,9 @@ def compute_loss(
     coords: torch.Tensor,
     type_label: torch.Tensor,
     coord_label: torch.Tensor,
-    coord_w: float = 1.0,
+    coord_w: float = C.coord_w,
     class_weights: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n_types = logits.size(-1)
     type_loss = F.cross_entropy(
         logits.reshape(-1, n_types),
@@ -66,13 +67,13 @@ def compute_loss(
         weight = class_weights
     )
     active_mask = type_label > Action_type.TYPE_IDLE.value
-    if active_mask.any():
-        coord_loss = F.mse_loss(coords[active_mask], coord_label[active_mask])
-    else:
-        coord_loss = coords.sum() * 0.0
-    
+    mask = active_mask.unsqueeze(-1)
+    diff = torch.where(mask, coords - coord_label, torch.zeros_like(coords))
+    coord_num = active_mask.sum()
+    coord_loss = diff.pow(2).sum() / (2 * coord_num).clamp(min=1)
+
     loss = type_loss + coord_w * coord_loss
-    return loss, type_loss, coord_loss
+    return loss, type_loss, coord_loss, coord_num
 
 @torch.no_grad()
 def evaluate(
@@ -82,18 +83,19 @@ def evaluate(
     device: str = C.device,
     class_weights: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    class_weights = torch.tensor(
-        C.class_weight, dtype=torch.float32, device=device
-    )
+    if class_weights is None:
+        class_weights = torch.tensor(
+            C.class_weight, dtype=torch.float32, device=device
+        )
     model.eval()
-    total_loss = 0.0
-    total_type_loss = 0.0
-    total_coord_loss = 0.0
-    total_correct = 0
+    total_type_loss = torch.zeros((), device=device)
+    total_coord_loss = torch.zeros((), device=device)
+    total_correct = torch.zeros((), dtype=torch.long, device=device)
     total_slots = 0
-    total_coord_err = 0.0
-    total_active_coords = 0
+    total_coord_err = torch.zeros((), device=device)
+    total_active_coords = torch.zeros((), dtype=torch.long, device=device)
     epoch_size = 0
+    total_coord_num = torch.zeros((), dtype=torch.long, device=device)
     for warmup, x, type_label, coord_label in val_loader:
         warmup = warmup.to(device, non_blocking = True)
         x = x.to(device, non_blocking = True)
@@ -101,34 +103,41 @@ def evaluate(
         coord_label = coord_label.to(device, non_blocking = True)
 
         logits, coords, h = model(x, warmup)
-        loss, type_loss, coord_loss = compute_loss(
+        loss, type_loss, coord_loss, coord_num = compute_loss(
             logits, coords, type_label, coord_label, coord_w, class_weights
         )
 
         bs = x.size(0) # batch_size可能不同，每个样本帧数必定相同
-        total_loss += loss.item() * bs
-        total_type_loss += type_loss.item() * bs
-        total_coord_loss += coord_loss.item() * bs
+        total_type_loss += type_loss.detach() * bs
+        total_coord_loss += coord_loss.detach() * coord_num
         epoch_size += bs
+        total_coord_num += coord_num
 
-        total_correct += (logits.argmax(-1) == type_label).sum().item()
+        total_correct += (logits.argmax(-1) == type_label).sum()
         total_slots += type_label.numel()
 
         active_mask = type_label > Action_type.TYPE_IDLE.value
-        total_coord_err += (
-            coords[active_mask] - coord_label[active_mask]
-        ).abs().sum().item()
-        total_active_coords += active_mask.sum().item() * coords.size(-1)
+        mask = active_mask.unsqueeze(-1)
+        coord_err = torch.where(
+            mask, (coords - coord_label).abs(), torch.zeros_like(coords)
+        )
+        total_coord_err += coord_err.sum()
+        total_active_coords += coord_num * coords.size(-1)
 
+    type_loss_t = total_type_loss / max(1, epoch_size)
+    coord_loss_t = total_coord_loss / total_coord_num.clamp(min=1)
+    loss_t = type_loss_t + coord_w * coord_loss_t
+    acc_t = total_correct / total_slots if total_slots else total_correct * 0.0
+    coord_mae_t = total_coord_err / total_active_coords.clamp(min=1)
+    loss, type_loss, coord_loss, acc, coord_mae = torch.stack(
+        [loss_t, type_loss_t, coord_loss_t, acc_t, coord_mae_t]
+    ).tolist()
     metrics = {
-        "loss": total_loss / epoch_size,
-        "type_loss": total_type_loss / epoch_size,
-        "coord_loss": total_coord_loss / epoch_size,
-        "acc": total_correct / total_slots if total_slots else 0.0,
-        "coord_mae": (
-            total_coord_err / total_active_coords
-            if total_active_coords else 0.0
-        ),
+        "loss": loss,
+        "type_loss": type_loss,
+        "coord_loss": coord_loss,
+        "acc": acc,
+        "coord_mae": coord_mae,
     }
     print(
         f" evaluate:"
@@ -159,14 +168,27 @@ def train_chunks(
     )
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
+    log_file = save_path / "train_log.csv"
+    log_header = [
+        "epoch", "train_loss", "train_type_loss", "train_coord_loss",
+        "val_loss", "val_type_loss", "val_coord_loss", "val_acc", "val_coord_mae",
+        "is_best",
+    ]
+    # 追加模式写日志：重开训练不覆盖历史；文件为空时才写表头
+    log_is_new = not log_file.exists() or log_file.stat().st_size == 0
+    log_f = log_file.open("a", encoding="utf-8", newline="")
+    writer = csv.writer(log_f)
+    if log_is_new:
+        writer.writerow(log_header)
+    print(f"  training log: {log_file}")
     best_val_loss = float("inf")
     for i in range(1, epochs + 1):
         model.train()
         step_idx = 0
-        total_loss = 0.0
-        total_type_loss = 0.0
-        total_coord_loss = 0.0
+        total_type_loss = torch.zeros((), device=device)
+        total_coord_loss = torch.zeros((), device=device)
         epoch_size = 0
+        total_coord_num = torch.zeros((), dtype=torch.long, device=device)
         for warmup, x, type_label, coord_label in train_loader:
             step_idx += 1
             warmup = warmup.to(device, non_blocking = True)
@@ -175,29 +197,33 @@ def train_chunks(
             coord_label = coord_label.to(device, non_blocking = True)
 
             logits, coords, h = model(x, warmup)
-            loss, type_loss, coord_loss = compute_loss(logits, coords, type_label, coord_label, coord_w, class_weights)
+            loss, type_loss, coord_loss, coord_num = compute_loss(logits, coords, type_label, coord_label, coord_w, class_weights)
 
             opt.zero_grad()
             loss.backward()
             opt.step()
 
             bs = x.size(0) # batch_size可能不同，每个样本帧数必定相同
-            total_loss += loss.item() * bs
-            total_type_loss += type_loss.item() * bs
-            total_coord_loss += coord_loss.item() * bs
+            total_type_loss += type_loss.detach() * bs
+            total_coord_loss += coord_loss.detach() * coord_num
+            total_coord_num += coord_num
             epoch_size += bs
 
             if log_interval > 0 and step_idx % log_interval == 0:
-                avg_loss = total_loss / epoch_size
-                avg_type_loss = total_type_loss / epoch_size
-                avg_coord_loss = total_coord_loss / epoch_size
+                avg_type_loss, avg_coord_loss = torch.stack([
+                    total_type_loss / max(1, epoch_size),
+                    total_coord_loss / total_coord_num.clamp(min=1),
+                ]).tolist()
+                avg_loss = avg_type_loss + coord_w * avg_coord_loss
                 print(
                     f"  [Epoch {i:03d} | Step {step_idx:04d}/{len(train_loader):04d}] "
                     f"  loss={avg_loss:.4f} type_loss={avg_type_loss:.4f} coord_loss={avg_coord_loss:.4f}"
                 )
-        avg_loss = total_loss / epoch_size
-        avg_type_loss = total_type_loss / epoch_size
-        avg_coord_loss = total_coord_loss / epoch_size
+        avg_type_loss, avg_coord_loss = torch.stack([
+            total_type_loss / max(1, epoch_size),
+            total_coord_loss / total_coord_num.clamp(min=1),
+        ]).tolist()
+        avg_loss = avg_type_loss + coord_w * avg_coord_loss
         print(
             f" [Epoch {i:03d} / {epochs:03d}]"
             f" average_loss = {avg_loss:.4f} type_loss={avg_type_loss:.4f} coord_loss={avg_coord_loss:.4f}"
@@ -206,13 +232,15 @@ def train_chunks(
         # 每轮都保存最新权重；有验证集时按验证 loss 另存最优权重
         torch.save(model.state_dict(), save_path / "last.pt")
         print(f"  saved last: {save_path / 'last.pt'}")
-
+        metrics: dict[str, float] | None = None
+        is_best = False
         if val_loader is not None:
             metrics = evaluate(
                 model, val_loader, coord_w, device, class_weights
             )
             if metrics["loss"] < best_val_loss:
                 best_val_loss = metrics["loss"]
+                is_best = True
                 torch.save(model.state_dict(), save_path / "best.pt")
                 print(
                     f"  saved best: {save_path / 'best.pt'}"
@@ -220,10 +248,25 @@ def train_chunks(
                 )
             model.train()   # evaluate 内部切到了 eval，这里切回训练模式
 
+        # 每轮结束把 train/val 指标写入 CSV 日志
+        row: list[object] = [i, avg_loss, avg_type_loss, avg_coord_loss]
+        if metrics is not None:
+            row += [
+                metrics["loss"], metrics["type_loss"], metrics["coord_loss"],
+                metrics["acc"], metrics["coord_mae"],
+            ]
+        else:
+            row += ["", "", "", "", ""]
+        row.append(int(is_best))
+        writer.writerow(row)
+        log_f.flush()   # 每轮落盘，中断也不丢历史
+
+    log_f.close()
+
 @dataclass
 class DataPair:
     label_name: str | None = None
-    vedio_name: str | None = None
+    video_name: str | None = None
     num_frames: int | None = None
     max_slots: int | None = None
 
@@ -248,12 +291,12 @@ def find_maps() -> dict[int, DataPair]:
         pair = dataPairList.setdefault(int(name[i:j]), DataPair())
         pair.label_name = name
 
-    for p in Path(C.vedio_path).rglob("*.mp4"):
+    for p in Path(C.video_path).rglob("*.mp4"):
         name = p.name
         i = name.rfind("[") + 1
         j = name.rfind("]")
         pair = dataPairList.setdefault(int(name[i:j]), DataPair())
-        pair.vedio_name = name
+        pair.video_name = name
         meta = info.get(Path(name).stem)
         if meta is not None:
             pair.num_frames = int(meta["num_frames"])
@@ -263,7 +306,7 @@ def find_maps() -> dict[int, DataPair]:
         key: pair
         for key, pair in dataPairList.items()
         if pair.label_name and 
-        pair.vedio_name and pair.num_frames
+        pair.video_name and pair.num_frames
     }
     print(f"找到 {len(result)} 个谱面")
     print(f"跳过 {len(dataPairList) - len(result)} 个缺少 label/video/manifest 的谱面")
@@ -274,32 +317,30 @@ def build_chunks(
     dataPairs: dict[int, DataPair],
     seed: int,
     m_train: int,
-    n_test: int,
+    n_val: int,
 ) -> tuple[ChunkSet, ChunkSet]:
-    """遍历所有谱面：前 m_train 个进训练集，最后 n_test 个进测试集，其余跳过。"""
+    """遍历所有谱面：前 m_train 个进训练集，最后 n_val 个进验证集，其余跳过。"""
     items = sorted(dataPairs.items())
     total = len(items)
 
     train: ChunkSet = ([], [], [])
-    test: ChunkSet = ([], [], [])
+    val: ChunkSet = ([], [], [])
     rng_train = random.Random(seed)
-    rng_test = random.Random(seed + 1)
 
     for idx, (_, item) in enumerate(items):
-        if idx < m_train:
+        is_train = idx < m_train
+        if is_train:
             names, starts, labels = train
-            rng = rng_train
-        elif idx >= total - n_test:
-            names, starts, labels = test
-            rng = rng_test
+        elif idx >= total - n_val:
+            names, starts, labels = val
         else:
             continue
 
-        if item.vedio_name is None or item.label_name is None:
+        if item.video_name is None or item.label_name is None:
             continue
         frame_num = item.num_frames
         if frame_num is None or frame_num <= 0:
-            print(f"跳过 {item.vedio_name}: manifest 缺少 num_frames")
+            print(f"跳过 {item.video_name}: manifest 缺少 num_frames")
             continue
 
         frame_label: list[D.Frame_teacher] = D.parse_finger_jsonl(
@@ -311,18 +352,24 @@ def build_chunks(
             chunk_max_slot = D.count_max_slot(frame_label, frame)
             if chunk_max_slot > C.n_slot:
                 continue
-            if chunk_max_slot == 0 and rng.random() >= C.p_empty_chunk:
+            if is_train and chunk_max_slot == 0 and rng_train.random() >= C.p_empty_chunk:
                 continue
-            names.append(item.vedio_name)
+            names.append(item.video_name)
             starts.append(frame)
             labels.append(frame_label)
-    return train, test
+    return train, val
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def main() -> None:
+    set_seed(C.seed)
     dataPairs: dict[int, DataPair] = find_maps()
 
-    # 第一版：取 id 最小的 80 个谱面训练，id 最大的 20 个谱面测试
+    # 第一版：取 id 最小的 100 个谱面训练，id 最大的 20 个谱面验证
     (train_names, 
     train_starts, 
     train_labels
@@ -331,13 +378,13 @@ def main() -> None:
     val_labels,
     ) = build_chunks(
         dataPairs,
-        seed=20261104,
+        seed=C.seed,
         m_train=C.n_train,
-        n_test=C.n_test,
+        n_val=C.n_val,
     )
     print(
         f"训练谱面/样本: {len(set(train_names))}/{len(train_starts)} | "
-        f"测试谱面/样本: {len(set(val_names))}/{len(val_starts)}"
+        f"验证谱面/样本: {len(set(val_names))}/{len(val_starts)}"
     )
 
     train_dataset = D.VideoChunkDataset(
@@ -370,22 +417,19 @@ def main() -> None:
         num_workers=C.num_threads,
         pin_memory=C.pin_memory
     )
+    # val 只用于训练期选择 best.pt；最终测试直接用真实场景的连续视频推理，
+    # 不复用这里的 val 结果作为最终指标。
     model = M.Model()
     train_chunks(
         model,
         train_loader,
-        epochs = 20,
-        lr = 1e-3,
+        val_loader,
+        epochs = C.epochs,
+        lr = C.lr,
         coord_w = C.coord_w,
         device = C.device,
-        save_dir="checkpoints",
-        log_interval=20,
-    )
-    evaluate(
-        model,
-        val_loader,
-        coord_w=C.coord_w,
-        device=C.device,
+        save_dir=C.save_dir,
+        log_interval=C.log_interval,
     )
     return
 
