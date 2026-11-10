@@ -156,6 +156,7 @@ def train_chunks(
     val_loader: DataLoader[Any] | None = None,  # 验证集数据加载器（可选）
     epochs: int = 20,
     lr: float = 1e-3,
+    lr_min_ratio: float = 0.05,   # 余弦退火终点 lr = lr * lr_min_ratio
     coord_w: float = C.coord_w,
     device: str = C.device,
     save_dir: str = C.save_dir,
@@ -163,6 +164,10 @@ def train_chunks(
 ) -> None:
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # 余弦退火：lr 随 epoch 从 lr 平滑衰减到 lr * lr_min_ratio
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=epochs, eta_min=lr * lr_min_ratio
+    )
     class_weights = torch.tensor(
         C.class_weight, dtype=torch.float32, device=device
     )
@@ -172,9 +177,8 @@ def train_chunks(
     log_header = [
         "epoch", "train_loss", "train_type_loss", "train_coord_loss",
         "val_loss", "val_type_loss", "val_coord_loss", "val_acc", "val_coord_mae",
-        "is_best",
+        "is_best", "lr",
     ]
-    # 追加模式写日志：重开训练不覆盖历史；文件为空时才写表头
     log_is_new = not log_file.exists() or log_file.stat().st_size == 0
     log_f = log_file.open("a", encoding="utf-8", newline="")
     writer = csv.writer(log_f)
@@ -184,6 +188,7 @@ def train_chunks(
     best_val_loss = float("inf")
     for i in range(1, epochs + 1):
         model.train()
+        lr_now = opt.param_groups[0]["lr"]   # 本轮实际使用的学习率
         step_idx = 0
         total_type_loss = torch.zeros((), device=device)
         total_coord_loss = torch.zeros((), device=device)
@@ -227,11 +232,14 @@ def train_chunks(
         print(
             f" [Epoch {i:03d} / {epochs:03d}]"
             f" average_loss = {avg_loss:.4f} type_loss={avg_type_loss:.4f} coord_loss={avg_coord_loss:.4f}"
+            f" lr={lr_now:.2e}"
         )
+        scheduler.step()   # 本轮 opt.step 全部完成后更新学习率
 
-        # 每轮都保存最新权重；有验证集时按验证 loss 另存最优权重
+        # 每轮保存权重快照（按 epoch 命名），last.pt 指向最新一轮；有验证集时另存 best.pt
+        torch.save(model.state_dict(), save_path / f"epoch_{i:03d}.pt")
         torch.save(model.state_dict(), save_path / "last.pt")
-        print(f"  saved last: {save_path / 'last.pt'}")
+        print(f"  saved epoch_{i:03d}.pt")
         metrics: dict[str, float] | None = None
         is_best = False
         if val_loader is not None:
@@ -258,6 +266,7 @@ def train_chunks(
         else:
             row += ["", "", "", "", ""]
         row.append(int(is_best))
+        row.append(lr_now)
         writer.writerow(row)
         log_f.flush()   # 每轮落盘，中断也不丢历史
 
@@ -277,7 +286,6 @@ ChunkSet = tuple[list[str], list[int], list[list[D.Frame_teacher]]]
 def find_maps() -> dict[int, DataPair]:
     dataPairList: dict[int, DataPair] = {}
 
-    # manifest 只读一次，补齐帧数和最大槽位数
     with (Path(C.label_path) / "manifest.json").open(encoding="utf-8") as F:
         manifest = json.load(F)
         info = {}
@@ -286,8 +294,8 @@ def find_maps() -> dict[int, DataPair]:
 
     for p in Path(C.label_path).rglob("*.jsonl"):
         name = p.name
-        i = name.rindex("_[") + len("_[")   # 跳过起始标记
-        j = name.index("]-", i)              # 从 i 之后找结束标记
+        i = name.rindex("_[") + len("_[")   
+        j = name.index("]-", i)              
         pair = dataPairList.setdefault(int(name[i:j]), DataPair())
         pair.label_name = name
 
@@ -369,7 +377,6 @@ def main() -> None:
     set_seed(C.seed)
     dataPairs: dict[int, DataPair] = find_maps()
 
-    # 第一版：取 id 最小的 100 个谱面训练，id 最大的 20 个谱面验证
     (train_names, 
     train_starts, 
     train_labels
