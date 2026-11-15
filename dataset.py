@@ -181,9 +181,9 @@ class VideoChunkDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
         meta = self._probe(name)
         path = str(Path(C.video_path) / name)
         out = subprocess.run(
-            ["ffmpeg", "-v", "error",
+            ["ffmpeg", "-v", "error", "-nostdin", "-threads", "1",
              "-ss", f"{start_frame / meta.fps:.6f}",
-             "-i", path, "-frames:v", str(count),
+             "-i", path, "-an", "-frames:v", str(count),
              "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
             capture_output=True,
         )

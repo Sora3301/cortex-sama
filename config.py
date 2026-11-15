@@ -5,7 +5,7 @@ from enum import IntEnum
 label_path = "../map-set-labels"
 video_path = "../map-set-video"
 
-n_slot: int = 4
+n_slot: int = 6
 # 槽位动作类别定义 (n_types = 4)
 class Action_type(IntEnum):
     TYPE_IDLE = 0   # 空置

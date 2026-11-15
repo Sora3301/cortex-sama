@@ -371,6 +371,7 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
 
 
 def main() -> None:
@@ -414,15 +415,18 @@ def main() -> None:
         batch_size=C.batch_size,
         shuffle=True,
         num_workers=C.num_threads,
-        pin_memory=C.pin_memory
-
+        pin_memory=C.pin_memory,
+        persistent_workers=C.num_threads > 0,
+        prefetch_factor=4 if C.num_threads > 0 else None,
     )
     val_loader: DataLoader[Any] = DataLoader(
         val_dataset,
         batch_size=C.batch_size,
         shuffle=False,
         num_workers=C.num_threads,
-        pin_memory=C.pin_memory
+        pin_memory=C.pin_memory,
+        persistent_workers=C.num_threads > 0,
+        prefetch_factor=4 if C.num_threads > 0 else None,
     )
     # val 只用于训练期选择 best.pt；最终测试直接用真实场景的连续视频推理，
     # 不复用这里的 val 结果作为最终指标。
