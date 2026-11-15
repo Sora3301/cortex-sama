@@ -260,7 +260,8 @@ def predict_notes(
 
             # 一个音符的起点：idle -> 任意动作，或 hold -> down 这种换音符
             if cur == Action_type.TYPE_DOWN:
-                onset = old not in (Action_type.TYPE_DOWN, Action_type.TYPE_HOLD)
+                # hold 结束后新的 down 是一个新音符；只有连续 down 不算新起点
+                onset = old != Action_type.TYPE_DOWN
                 kind = "tap"
             elif cur == Action_type.TYPE_HOLD:
                 onset = old not in (Action_type.TYPE_HOLD, Action_type.TYPE_DOWN)
@@ -392,7 +393,17 @@ def score_matches(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="视频推理 + Phira 计分")
-    p.add_argument("--ckpt", default="checkpoints/best.pt", help=".pt 权重路径")
+    p.add_argument("--ckpt", default="checkpoints/1113/epoch_011.pt", help=".pt 权重路径")
+    p.add_argument(
+        "--video",
+        default="../map-set-video/Echo [IN Lv.15] [8695].mp4",
+        help="待测试视频路径",
+    )
+    p.add_argument(
+        "--label",
+        default="../map-set-labels/Echo_[IN_Lv.15]_[8695]-8c7d86c9.jsonl",
+        help="对应标签 JSONL 路径",
+    )
     p.add_argument("--seq", type=int, default=C.seq_len, help="每块帧数")
     p.add_argument("--max-frames", type=int, default=0,
                    help="最多读取多少帧，0 表示整段视频")
@@ -423,11 +434,11 @@ def main() -> None:
     device = pick_device(args.device)
 
     t0 = time.perf_counter()
-    video = VideoLoader("../map-set-video/钢琴-アイデン貞貞メルトダウン [hd Lv.8] [157].mp4", args.max_frames)
+    video = VideoLoader(args.video, args.max_frames)
     video_load_ms = (time.perf_counter() - t0) * 1000.0
 
     t0 = time.perf_counter()
-    labels = D.parse_finger_jsonl("../map-set-labels/钢琴-アイデン貞貞メルトダウン_[hd_Lv.8]_[157]-7dc672f7.jsonl", total_frames=len(video))
+    labels = D.parse_finger_jsonl(args.label, total_frames=len(video))
     labels = labels[:len(video)]
     label_parse_ms = (time.perf_counter() - t0) * 1000.0
 
