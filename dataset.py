@@ -15,11 +15,12 @@ dataset.py —— 数据扫描、事件流解析、视频帧读取与 PyTorch Da
 """
 import json
 import math
-import subprocess
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import av
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -115,30 +116,23 @@ def parse_finger_jsonl(
     return frame_label_list
 
 
-@dataclass
-class VideoMeta:
-    fps: float
-    width: int
-    height: int
-
-
 class VideoChunkDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
     """滑窗视频块数据集。
 
     __getitem__ 返回 (warmup, x, type_label, coord_label)：
-      warmup:      (warmup, 3, H, W) float32 ∈ [0,1]  前置上下文帧
-      x:           (T, 3, H, W) float32 ∈ [0,1]       目标帧
+      warmup:      (warmup, 3, H, W) float32 ∈ [0,1]（normalize=False 时为 uint8）
+      x:           (T, 3, H, W)      float32 ∈ [0,1]（normalize=False 时为 uint8）
       type_label:  (T, n_slots) int64                 每槽位动作类型
       coord_label: (T, n_slots, 2) float32 ∈ [-1,1]   每槽位归一化坐标
 
     约定：
-      - video[i] 是视频文件名，teaching_data[i] 是该视频按帧下标的标签列表，
+      - video[i] 可为文件名（相对 video_dir）或已存在的视频路径，teaching_data[i] 是该视频按帧下标的标签列表，
         start[i] 是目标块第一帧的绝对帧号（warmup 帧取 [start-warmup, start)）
       - 槽位编号 = 该帧活跃槽位按 (x, y, type) 排序后的位置，不足 n_slots 的填 TYPE_IDLE
 
-    实现说明：环境无 cv2/decord，帧解码走 ffmpeg 子进程。mp4 用 -ss 输入定位
-    是帧精确的，每个视频的 fps/分辨率只探测一次并缓存。build_chunks 保证
-    [start-warmup, start+T) 都在视频范围内，解码帧数不足时直接报错。
+    实现说明：使用 PyAV (libav) 在 worker 进程内直接 seek 并解码目标帧区间，避免每 chunk
+    启停 ffmpeg 子进程的开销；build_chunks 保证 [start-warmup, start+T) 都在视频范围内，
+    解码帧数不足时直接报错。
     """
 
     def __init__(
@@ -146,59 +140,84 @@ class VideoChunkDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
         video: list[str],
         teaching_data: list[list[Frame_teacher]],
         start: list[int],
-        T: int, # chunk大小
-        warmup: int, # warmup大小
+        T: int,  # chunk大小
+        warmup: int,  # warmup大小
+        video_dir: str | Path = C.video_path,
+        normalize: bool = True,
     ) -> None:
         if not (len(video) == len(teaching_data) == len(start)):
             raise ValueError("video / teaching_data / start 长度必须一致")
+        if T <= 0:
+            raise ValueError("T 必须大于 0")
+        if warmup < 0:
+            raise ValueError("warmup 不能为负数")
+        if any(s < warmup for s in start):
+            raise ValueError("start 中的帧号必须 >= warmup")
         self.video = video
         self.teaching_data = teaching_data
         self.start = start
         self.T = T
         self.warmup = warmup
+        self.video_dir = Path(video_dir)
+        self.normalize = normalize
         self.n_slots = C.n_slot
-        # 每个视频的解码参数（fps/宽高）只探测一次
-        self._video_meta: dict[str, VideoMeta] = {}
+        self._resolved_paths: dict[str, str] = {}
 
-    def _probe(self, name: str) -> VideoMeta:
-        meta = self._video_meta.get(name)
-        if meta is None:
-            path = str(Path(C.video_path) / name)
-            out = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=r_frame_rate,width,height",
-                 "-of", "json", path],
-                capture_output=True, text=True, check=True,
-            )
-            s = json.loads(out.stdout)["streams"][0]
-            num, den = (int(x) for x in s["r_frame_rate"].split("/"))
-            meta = VideoMeta(fps=num / den, width=int(s["width"]), height=int(s["height"]))
-            self._video_meta[name] = meta
-        return meta
+    def _resolve_path(self, name: str) -> str:
+        cached = self._resolved_paths.get(name)
+        if cached is not None:
+            return cached
+        p = Path(name)
+        resolved = str(p) if p.is_file() else str(self.video_dir / name)
+        self._resolved_paths[name] = resolved
+        return resolved
 
     def _read_frames(self, name: str, start_frame: int, count: int) -> torch.Tensor:
-        """解码 [start_frame, start_frame+count) 帧，返回 (count, 3, H, W) float32 ∈ [0,1]"""
-        meta = self._probe(name)
-        path = str(Path(C.video_path) / name)
-        out = subprocess.run(
-            ["ffmpeg", "-v", "error", "-nostdin", "-threads", "1",
-             "-ss", f"{start_frame / meta.fps:.6f}",
-             "-i", path, "-an", "-frames:v", str(count),
-             "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
-            capture_output=True,
-        )
-        h, w = meta.height, meta.width
-        buf = np.frombuffer(out.stdout, dtype=np.uint8)
-        n_got = buf.size // (h * w * 3)
-        if n_got != count:
+        """解码 [start_frame, start_frame+count) 帧，返回 (count, 3, H, W) uint8 张量"""
+        if start_frame < 0:
+            raise ValueError(f"start_frame 不能为负数: {start_frame}")
+        path = self._resolve_path(name)
+        with av.open(path) as container:
+            if not container.streams.video:
+                raise RuntimeError(f"视频文件不含视频流: {path}")
+            stream = container.streams.video[0]
+            stream.thread_count = 1
+            rate = stream.average_rate or stream.guessed_rate
+            tb = stream.time_base
+            if rate is None or rate <= 0 or tb is None:
+                raise RuntimeError(f"无法读取视频帧率或 time_base: {path}")
+
+            start_pts = stream.start_time if stream.start_time is not None else 0
+            step_pts = Fraction(1) / (rate * tb)
+            target_pts = start_pts + round(start_frame * step_pts)
+            min_pts = target_pts - step_pts / 2
+
+            if start_frame > 0:
+                container.seek(target_pts, backward=True, any_frame=False, stream=stream)
+
+            buf: np.ndarray | None = None
+            got = 0
+            for frame in container.decode(stream):
+                pts = frame.pts
+                if pts is None or pts < min_pts:
+                    continue
+                if got == 0 and pts > target_pts + step_pts / 2:
+                    raise RuntimeError(
+                        f"视频 {name} seek 到第 {start_frame} 帧失败（首帧 pts={pts} 超过目标 {target_pts}）"
+                    )
+                if buf is None:
+                    buf = np.empty((count, frame.height, frame.width, 3), dtype=np.uint8)
+                buf[got] = frame.to_ndarray(format="rgb24")
+                got += 1
+                if got == count:
+                    break
+
+        if buf is None or got != count:
             raise RuntimeError(
-                f"视频 {name} 从第 {start_frame} 帧起只解码出 {n_got}/{count} 帧，"
+                f"视频 {name} 从第 {start_frame} 帧起只解码出 {got}/{count} 帧，"
                 "说明 start 越界或视频/manifest 帧数不一致"
             )
-        # frombuffer 得到的是只读数组，copy 一份再整形
-        arr = buf.copy().reshape(count, h, w, 3)
-        t = torch.from_numpy(arr).float() / 255.0      # (count, h, w, 3)
-        return t.permute(0, 3, 1, 2).contiguous()      # (count, 3, h, w)
+        return torch.from_numpy(buf).permute(0, 3, 1, 2)
 
     def __len__(self) -> int:
         return len(self.start)
@@ -209,13 +228,17 @@ class VideoChunkDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
         labels = self.teaching_data[idx]
 
         frames = self._read_frames(name, s - self.warmup, self.warmup + self.T)
-        warmup = frames[: self.warmup]
-        x = frames[self.warmup:]
+        warmup = frames[: self.warmup].contiguous()
+        x = frames[self.warmup :].contiguous()
+        if self.normalize:
+            warmup = warmup.float().div_(255.0)
+            x = x.float().div_(255.0)
 
         type_label = torch.zeros(self.T, self.n_slots, dtype=torch.long)
         coord_label = torch.zeros(self.T, self.n_slots, 2, dtype=torch.float32)
         for t in range(self.T):
-            frame_label = labels[s + t] if s + t < len(labels) else None
+            pos = s + t
+            frame_label = labels[pos] if 0 <= pos < len(labels) else None
             if frame_label is None:
                 continue
             for i, slot in enumerate(frame_label.slot[: self.n_slots]):

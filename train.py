@@ -99,6 +99,10 @@ def evaluate(
     for warmup, x, type_label, coord_label in val_loader:
         warmup = warmup.to(device, non_blocking = True)
         x = x.to(device, non_blocking = True)
+        if warmup.dtype == torch.uint8:
+            warmup = warmup.float().div_(255.0)
+        if x.dtype == torch.uint8:
+            x = x.float().div_(255.0)
         type_label = type_label.to(device, non_blocking = True)
         coord_label = coord_label.to(device, non_blocking = True)
 
@@ -198,6 +202,10 @@ def train_chunks(
             step_idx += 1
             warmup = warmup.to(device, non_blocking = True)
             x = x.to(device, non_blocking = True)
+            if warmup.dtype == torch.uint8:
+                warmup = warmup.float().div_(255.0)
+            if x.dtype == torch.uint8:
+                x = x.float().div_(255.0)
             type_label = type_label.to(device, non_blocking = True)
             coord_label = coord_label.to(device, non_blocking = True)
 
@@ -401,6 +409,7 @@ def main() -> None:
         train_starts,
         C.seq_len,
         C.warmup_len,
+        normalize=False,
     )
     val_dataset = D.VideoChunkDataset(
         val_names,
@@ -408,6 +417,7 @@ def main() -> None:
         val_starts,
         C.seq_len,
         C.warmup_len,
+        normalize=False,
     )
 
     train_loader: DataLoader[Any] = DataLoader(

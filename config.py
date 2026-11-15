@@ -3,7 +3,7 @@ from enum import IntEnum
 
 # 路径
 label_path = "../map-set-labels"
-video_path = "../map-set-video"
+video_path = "../map-set-video2"
 
 n_slot: int = 6
 # 槽位动作类别定义 (n_types = 4)
