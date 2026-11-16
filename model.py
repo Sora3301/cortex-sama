@@ -110,7 +110,6 @@ class CausalBlock(nn.Module):
         x_pad = F.pad(x, (pad, 0))
         return x + F.relu(self.conv(x_pad))
 
-
 class CausalTCN(nn.Module):
     """因果时间卷积网络，输入/输出都是 (B,T,C,H,W)。
 
@@ -288,28 +287,29 @@ class Model(nn.Module):
         x: torch.Tensor,
         h: torch.Tensor | None = None,
         tcn_cache: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         # x: (B, T, 3, H, W)
         f5, fused, B, T = self._extract_features(x)
         logits, ctx, h = self.head(f5, B, T, h)
 
-        local, _ = self.tcn(fused, tcn_cache)       # (B,T,256,12,20)
+        local, tcn_cache = self.tcn(fused, tcn_cache)       # (B,T,256,12,20)
         local = local.reshape(B * T, *local.shape[2:])  # (B*T,256,12,20)
 
         local = self.film(local, ctx.reshape(B * T, -1))
         heat = self.heatmap_head(local)             # (B*T,S,24,40)
         coords = heatmap_to_coords(heat).view(B, T, self.head.n_slots, 2)
 
-        return logits, coords, h
+        return logits, coords, h, tcn_cache
 
     def forward(
         self,
         x: torch.Tensor,
         warmup: torch.Tensor | None = None,
         h: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if h is not None:
-            return self._forward(x, h)
+        tcn_cache: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if h is not None or tcn_cache is not None:
+            return self._forward(x, h, tcn_cache)
 
         if warmup is not None:
             if warmup.dim() == 4:
@@ -321,4 +321,4 @@ class Model(nn.Module):
                     cache = fused_w[:, -self.tcn.cache_len:]
                 return self._forward(x, h, cache)
 
-        return self._forward(x, h)
+        return self._forward(x, h, tcn_cache)

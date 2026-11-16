@@ -106,7 +106,7 @@ def evaluate(
         type_label = type_label.to(device, non_blocking = True)
         coord_label = coord_label.to(device, non_blocking = True)
 
-        logits, coords, h = model(x, warmup)
+        logits, coords, h, _ = model(x, warmup)
         loss, type_loss, coord_loss, coord_num = compute_loss(
             logits, coords, type_label, coord_label, coord_w, class_weights
         )
@@ -209,7 +209,7 @@ def train_chunks(
             type_label = type_label.to(device, non_blocking = True)
             coord_label = coord_label.to(device, non_blocking = True)
 
-            logits, coords, h = model(x, warmup)
+            logits, coords, h, _ = model(x, warmup)
             loss, type_loss, coord_loss, coord_num = compute_loss(logits, coords, type_label, coord_label, coord_w, class_weights)
 
             opt.zero_grad()

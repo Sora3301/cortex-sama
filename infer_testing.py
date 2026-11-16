@@ -214,6 +214,7 @@ def predict_notes(
     total_frames = 0
 
     h: torch.Tensor | None = None
+    tcn_cache: torch.Tensor | None = None
     for start in range(0, len(video), seq):
         end = min(start + seq, len(video))
         n_frames = end - start
@@ -223,7 +224,9 @@ def predict_notes(
         t0 = time.perf_counter()
 
         chunk = video.frames[start:end].to(device).float().div_(255.0)
-        logits, coords, h = model(chunk.unsqueeze(0), h=h)
+        logits, coords, h, tcn_cache = model(
+            chunk.unsqueeze(0), h=h, tcn_cache=tcn_cache
+        )
         types = logits[0].argmax(-1).cpu()
         coords_cpu = coords[0].cpu()
         probs = logits[0].softmax(-1).cpu()
@@ -393,18 +396,18 @@ def score_matches(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="视频推理 + Phira 计分")
-    p.add_argument("--ckpt", default="checkpoints/1113/epoch_011.pt", help=".pt 权重路径")
+    p.add_argument("--ckpt", default="checkpoints/checkpoints1114/best.pt", help=".pt 权重路径")
     p.add_argument(
         "--video",
-        default="../map-set-video/Echo [IN Lv.15] [8695].mp4",
+        default="../map-set-video2/A Lasting Promise [AT Lv.18] [7039].mp4",
         help="待测试视频路径",
     )
     p.add_argument(
         "--label",
-        default="../map-set-labels/Echo_[IN_Lv.15]_[8695]-8c7d86c9.jsonl",
+        default="../map-set-labels/A_Lasting_Promise_[AT_Lv.18]_[7039]-e569d0fd.jsonl",
         help="对应标签 JSONL 路径",
     )
-    p.add_argument("--seq", type=int, default=C.seq_len, help="每块帧数")
+    p.add_argument("--seq", type=int, default=1, help="每块帧数")
     p.add_argument("--max-frames", type=int, default=0,
                    help="最多读取多少帧，0 表示整段视频")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
