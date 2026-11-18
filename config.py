@@ -14,7 +14,9 @@ class Action_type(IntEnum):
     TYPE_FLICK = 3  # 划动音符起始帧 (flick)
 
 coord_w: float = 2.0                                      # coord_loss 相对 type_loss 的权重
-class_weight: list[float] = [0.1, 1.0, 2.0, 4.0]          # 四种note的权重
+heat_w: float = 0.5                                       # 高斯热力图 KL 损失权重
+heat_sigma: float = 1.2                                   # 高斯热力图标准差（按热图网格单元计）
+class_weight: list[float] = [0.1, 1.0, 1.0, 4.0]          # 四种note的权重
 lr = 1e-3
 
 num_threads: int = 6

@@ -1,13 +1,15 @@
 """model.py —— 视觉特征提取、时序建模与多指预测模型。
 
 结构：
-    F5 -> TypeHead -> type logits + 全局时序上下文 ctx
-    F4 + F5 -> FPN -> CausalTCN -> FiLM(ctx) -> HeatmapHead -> soft-argmax -> coords
+    F4 + F5 -> FPN(+CoordConv) -> CausalTCN -> local
+    local -> HeatmapHead -> heat -> soft-argmax -> coords + prob
+    F5 -> GRU -> 全局时序上下文 ctx
+    [slot_feat(local 按 prob 池化), coords, slot_emb, ctx] -> CrossSlotBlock -> type logits
 
 说明：
-    - type 分支使用语义更强的 F5，并由 GRU 提供时序上下文
-    - coord 分支使用 FPN 融合后的空间特征，由 CausalTCN 提供时序信息
-    - heatmap 输出每个 slot 的空间概率图，soft-argmax 得到归一化坐标
+    - 坐标分支由 FPN + CoordConv + CausalTCN 定位出每个 slot 的高斯热力图并计算 coords
+    - 分类分支用热力图概率 prob 从含时序的 local 特征图加权提取各槽位局部特征，
+      再与 F5+GRU 全局上下文及槽位间 Self-Attention 融合预测动作类型
 """
 
 from __future__ import annotations
@@ -39,14 +41,15 @@ class CNNBackbone(nn.Module):
 
 
 class FPNFusion(nn.Module):
-    """把 F4 的细节和 F5 的语义融合成 12x20 的空间特征图。"""
+    """把 F4 的细节和 F5 的语义融合成 12x20 的空间特征图，并注入归一化坐标通道。"""
 
     def __init__(self, c4: int = 128, c5: int = 256, out_ch: int = 256) -> None:
         super().__init__()
         self.lat4 = nn.Conv2d(c4, out_ch, kernel_size=1)
         self.lat5 = nn.Conv2d(c5, out_ch, kernel_size=1)
+        self.out_ch = out_ch
         self.smooth = nn.Sequential(
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.Conv2d(out_ch + 2, out_ch, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
         )
 
@@ -59,29 +62,13 @@ class FPNFusion(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
-        return self.smooth(p4 + p5)
-
-
-class FiLM(nn.Module):
-    """Feature-wise Linear Modulation：用全局上下文调制空间特征。"""
-
-    def __init__(self, cond_dim: int, feat_dim: int) -> None:
-        super().__init__()
-        self.to_gamma_beta = nn.Linear(cond_dim, feat_dim * 2)
-
-        # 初始化为 identity：gamma=0, beta=0
-        weight = self.to_gamma_beta.weight
-        bias = self.to_gamma_beta.bias
-        if weight is not None:
-            nn.init.zeros_(weight)
-        if bias is not None:
-            nn.init.zeros_(bias)
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        gamma, beta = self.to_gamma_beta(cond).chunk(2, dim=-1)
-        gamma = gamma[:, :, None, None]
-        beta = beta[:, :, None, None]
-        return x * (1 + gamma) + beta
+        x = p4 + p5
+        N, _, H, W = x.shape
+        xs = (torch.arange(W, device=x.device, dtype=x.dtype) + 0.5) / W * 2 - 1
+        ys = (torch.arange(H, device=x.device, dtype=x.dtype) + 0.5) / H * 2 - 1
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        coords_map = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).expand(N, -1, -1, -1)
+        return self.smooth(torch.cat([x, coords_map], dim=1))
 
 
 class CausalBlock(nn.Module):
@@ -109,6 +96,7 @@ class CausalBlock(nn.Module):
         pad = (self.kernel_size - 1) * self.dilation
         x_pad = F.pad(x, (pad, 0))
         return x + F.relu(self.conv(x_pad))
+
 
 class CausalTCN(nn.Module):
     """因果时间卷积网络，输入/输出都是 (B,T,C,H,W)。
@@ -139,7 +127,7 @@ class CausalTCN(nn.Module):
         cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # x: (B, T, C, H, W)
-        B, T, C, H, W = x.shape
+        B, T, ch, H, W = x.shape
 
         if self.cache_len > 0 and cache is not None:
             cache = cache[:, -self.cache_len:]
@@ -150,14 +138,14 @@ class CausalTCN(nn.Module):
         T_all = x_all.shape[1]
 
         # (B,T,C,H,W) -> (B*H*W, C, T)
-        h = x_all.permute(0, 3, 4, 2, 1).reshape(B * H * W, C, T_all)
+        h = x_all.permute(0, 3, 4, 2, 1).reshape(B * H * W, ch, T_all)
         h = self.in_proj(h)
         for block in self.blocks:
             h = block(h)
         h = self.out_proj(h)
 
         # (B*H*W,C,T) -> (B,T,C,H,W)
-        h = h.reshape(B, H, W, C, T_all).permute(0, 4, 3, 1, 2).contiguous()
+        h = h.reshape(B, H, W, ch, T_all).permute(0, 4, 3, 1, 2).contiguous()
 
         # 只返回当前 x 对应的输出，cache 部分丢弃
         out = h[:, -T:]
@@ -188,8 +176,8 @@ class HeatmapHead(nn.Module):
         return self.net(feat)
 
 
-def heatmap_to_coords(heat: torch.Tensor) -> torch.Tensor:
-    """把 (N,S,H,W) heatmap 转成 (N,S,2) 归一化坐标。"""
+def heatmap_to_coords_and_prob(heat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """把 (N,S,H,W) heatmap 转成 (N,S,2) 归一化坐标和 (N,S,H,W) 概率图。"""
     N, S, H, W = heat.shape
     device = heat.device
     dtype = heat.dtype
@@ -203,19 +191,67 @@ def heatmap_to_coords(heat: torch.Tensor) -> torch.Tensor:
     prob = heat.flatten(2).softmax(dim=-1)  # (N,S,H*W)
     x = (prob * grid_x).sum(dim=-1)
     y = (prob * grid_y).sum(dim=-1)
-    return torch.stack([x, y], dim=-1)
+    return torch.stack([x, y], dim=-1), prob.view(N, S, H, W)
+
+
+def heatmap_to_coords(heat: torch.Tensor) -> torch.Tensor:
+    """把 (N,S,H,W) heatmap 转成 (N,S,2) 归一化坐标。"""
+    coords, _ = heatmap_to_coords_and_prob(heat)
+    return coords
+
+
+class CrossSlotBlock(nn.Module):
+    """槽位间轻量 Self-Attention + FFN，用于共享信息并抑制空闲槽位重复预测。"""
+
+    def __init__(self, dim: int = 128, n_heads: int = 4, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.norm1 = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.drop1 = nn.Dropout(dropout)
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, S, D)
+        N, S, D = x.shape
+        h = self.norm1(x)
+        qkv = self.qkv(h).view(N, S, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(N, S, D)
+        x = x + self.drop1(self.proj(out))
+        x = x + self.ffn(self.norm2(x))
+        return x
 
 
 class TypeHead(nn.Module):
-    """用 F5 的全局语义 + GRU 预测每个 slot 的动作类型。"""
+    """结合 F5+GRU 全局上下文与按热力图池化的局部时空特征预测每个 slot 的动作类型。"""
 
     def __init__(
         self,
         in_ch: int = 256,
+        local_ch: int = 256,
+        slot_dim: int = 64,
         hidden: int = 128,
         gru_hidden: int = 256,
+        slot_emb_dim: int = 16,
         n_slots: int = C.n_slot,
         n_types: int = 4,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.n_slots = n_slots
@@ -228,45 +264,69 @@ class TypeHead(nn.Module):
             batch_first=True,
             bidirectional=False,
         )
-        self.chunk = nn.Sequential(
+        self.global_proj = nn.Sequential(
             nn.Linear(gru_hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(inplace=True),
         )
-        self.type_head = nn.Linear(hidden, n_slots * n_types)
+        self.local_proj = nn.Sequential(
+            nn.Conv2d(local_ch, slot_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.slot_emb = nn.Embedding(n_slots, slot_emb_dim)
+        self.slot_in = nn.Sequential(
+            nn.Linear(slot_dim + 2 + slot_emb_dim + hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        self.cross_slot = CrossSlotBlock(dim=hidden, n_heads=4, dropout=dropout)
+        self.type_head = nn.Linear(hidden, n_types)
 
     def forward(
         self,
-        x: torch.Tensor,
+        f5: torch.Tensor,
+        local: torch.Tensor,
+        prob: torch.Tensor,
+        coords: torch.Tensor,
         B: int,
         T: int,
         h: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # x: (B*T, 256, H, W)
-        g = F.adaptive_max_pool2d(x, 1).flatten(1)      # (B*T, 256)
-        g = g.reshape(B, T, -1)                         # (B, T, 256)
-        out, h = self.gru(g, h)                         # (B, T, gru_hidden)
-        ctx = self.chunk(out.reshape(B * T, -1))        # (B*T, hidden)
-        logits = self.type_head(ctx).view(B, T, self.n_slots, self.n_types)
-        return logits, ctx.view(B, T, -1), h
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # f5: (B*T, 256, 6, 10), local: (B*T, 256, 12, 20)
+        # prob: (B*T, S, 24, 40), coords: (B*T, S, 2)
+        g = F.adaptive_max_pool2d(f5, 1).flatten(1).reshape(B, T, -1)
+        out, h = self.gru(g, h)
+        ctx = self.global_proj(out.reshape(B * T, -1))  # (B*T, hidden)
+
+        feat_map = self.local_proj(local)               # (B*T, slot_dim, 12, 20)
+        prob_low = F.adaptive_avg_pool2d(prob.detach(), feat_map.shape[-2:])
+        prob_low = prob_low / prob_low.sum(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        slot_feat = torch.einsum("nchw,nshw->nsc", feat_map, prob_low)  # (B*T, S, slot_dim)
+
+        slot_ids = torch.arange(self.n_slots, device=local.device)
+        slot_emb = self.slot_emb(slot_ids).unsqueeze(0).expand(B * T, -1, -1)
+        ctx_exp = ctx.unsqueeze(1).expand(-1, self.n_slots, -1)
+
+        token = torch.cat([slot_feat, coords.detach(), slot_emb, ctx_exp], dim=-1)
+        token = self.slot_in(token)                     # (B*T, S, hidden)
+        token = self.cross_slot(token)                  # (B*T, S, hidden)
+        logits = self.type_head(token).view(B, T, self.n_slots, self.n_types)
+        return logits, h
 
 
 class Model(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.backbone = CNNBackbone()
-        self.head = TypeHead()
         self.fpn = FPNFusion()
         self.tcn = CausalTCN(channels=256, hidden_size=128)
-        self.film = FiLM(cond_dim=128, feat_dim=256)
         self.heatmap_head = HeatmapHead(
             in_ch=256,
             n_slots=C.n_slot,
             out_size=(24, 40),
         )
+        self.head = TypeHead()
 
     def _extract_features(
         self,
@@ -287,38 +347,41 @@ class Model(nn.Module):
         x: torch.Tensor,
         h: torch.Tensor | None = None,
         tcn_cache: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
         # x: (B, T, 3, H, W)
         f5, fused, B, T = self._extract_features(x)
-        logits, ctx, h = self.head(f5, B, T, h)
 
         local, tcn_cache = self.tcn(fused, tcn_cache)       # (B,T,256,12,20)
-        local = local.reshape(B * T, *local.shape[2:])  # (B*T,256,12,20)
+        local_flat = local.reshape(B * T, *local.shape[2:])  # (B*T,256,12,20)
 
-        local = self.film(local, ctx.reshape(B * T, -1))
-        heat = self.heatmap_head(local)             # (B*T,S,24,40)
-        coords = heatmap_to_coords(heat).view(B, T, self.head.n_slots, 2)
+        heat = self.heatmap_head(local_flat)                 # (B*T,S,24,40)
+        coords_flat, prob = heatmap_to_coords_and_prob(heat)
 
-        return logits, coords, h, tcn_cache
+        logits, h = self.head(f5, local_flat, prob, coords_flat, B, T, h)
+        coords = coords_flat.view(B, T, self.head.n_slots, 2)
+        heat_out = heat.view(B, T, self.head.n_slots, *heat.shape[2:])
+        return logits, coords, h, tcn_cache, heat_out
 
     def forward(
         self,
         x: torch.Tensor,
         warmup: torch.Tensor | None = None,
         h: torch.Tensor | None = None,
-        tcn_cache: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        tcn_cache: torch.Tensor | None = None,
+        return_heat: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         if h is not None or tcn_cache is not None:
-            return self._forward(x, h, tcn_cache)
+            out = self._forward(x, h, tcn_cache)
+            return out if return_heat else out[:4]
 
         if warmup is not None:
             if warmup.dim() == 4:
                 warmup = warmup.unsqueeze(1)
             if warmup.size(1) > 0:
                 with torch.no_grad():
-                    f5_w, fused_w, B_w, T_w = self._extract_features(warmup)
-                    _, _, h = self.head(f5_w, B_w, T_w)
-                    cache = fused_w[:, -self.tcn.cache_len:]
-                return self._forward(x, h, cache)
+                    _, _, h, cache, _ = self._forward(warmup)
+                out = self._forward(x, h, cache)
+                return out if return_heat else out[:4]
 
-        return self._forward(x, h, tcn_cache)
+        out = self._forward(x, h, tcn_cache)
+        return out if return_heat else out[:4]

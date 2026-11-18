@@ -50,6 +50,26 @@ import dataset as D
 
 from config import Action_type as Action_type
 
+def make_gaussian_heatmap(
+    coord_label: torch.Tensor,
+    out_size: tuple[int, int],
+    sigma: float = C.heat_sigma,
+) -> torch.Tensor:
+    """把归一化坐标 (..., 2) 转成 (..., H, W) 归一化高斯概率分布。"""
+    H, W = out_size
+    device = coord_label.device
+    dtype = coord_label.dtype
+
+    xs = (torch.arange(W, device=device, dtype=dtype) + 0.5) / W * 2 - 1
+    ys = (torch.arange(H, device=device, dtype=dtype) + 0.5) / H * 2 - 1
+    prefix = (1,) * (coord_label.dim() - 1)
+    dx = (xs.view(*prefix, 1, W) - coord_label[..., 0:1].unsqueeze(-1)) * (W * 0.5)
+    dy = (ys.view(*prefix, H, 1) - coord_label[..., 1:2].unsqueeze(-1)) * (H * 0.5)
+    dist2 = dx.pow(2) + dy.pow(2)
+    log_target = F.log_softmax(-dist2.flatten(-2) / (2.0 * sigma * sigma), dim=-1)
+    return log_target.exp().view(*coord_label.shape[:-1], H, W)
+
+
 # 损失函数
 # 如果id持续绑定槽位，可能需要匹配手指的编号（未实现）
 def compute_loss(
@@ -59,7 +79,10 @@ def compute_loss(
     coord_label: torch.Tensor,
     coord_w: float = C.coord_w,
     class_weights: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    heat: torch.Tensor | None = None,
+    heat_w: float = C.heat_w,
+    heat_sigma: float = C.heat_sigma,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n_types = logits.size(-1)
     type_loss = F.cross_entropy(
         logits.reshape(-1, n_types),
@@ -72,8 +95,20 @@ def compute_loss(
     coord_num = active_mask.sum()
     coord_loss = diff.pow(2).sum() / (2 * coord_num).clamp(min=1)
 
-    loss = type_loss + coord_w * coord_loss
-    return loss, type_loss, coord_loss, coord_num
+    if heat is not None and heat_w > 0:
+        target_prob = make_gaussian_heatmap(
+            coord_label, heat.shape[-2:], sigma=heat_sigma
+        )
+        log_pred = F.log_softmax(heat.flatten(-2), dim=-1)
+        kl = F.kl_div(
+            log_pred, target_prob.flatten(-2), reduction="none"
+        ).sum(dim=-1)
+        heat_loss = (kl * active_mask).sum() / coord_num.clamp(min=1)
+    else:
+        heat_loss = coords.new_zeros(())
+
+    loss = type_loss + coord_w * coord_loss + heat_w * heat_loss
+    return loss, type_loss, coord_loss, heat_loss, coord_num
 
 @torch.no_grad()
 def evaluate(
@@ -82,6 +117,8 @@ def evaluate(
     coord_w: float = 2.0,
     device: str = C.device,
     class_weights: torch.Tensor | None = None,
+    heat_w: float = C.heat_w,
+    heat_sigma: float = C.heat_sigma,
 ) -> dict[str, float]:
     if class_weights is None:
         class_weights = torch.tensor(
@@ -90,6 +127,7 @@ def evaluate(
     model.eval()
     total_type_loss = torch.zeros((), device=device)
     total_coord_loss = torch.zeros((), device=device)
+    total_heat_loss = torch.zeros((), device=device)
     total_correct = torch.zeros((), dtype=torch.long, device=device)
     total_slots = 0
     total_coord_err = torch.zeros((), device=device)
@@ -106,14 +144,16 @@ def evaluate(
         type_label = type_label.to(device, non_blocking = True)
         coord_label = coord_label.to(device, non_blocking = True)
 
-        logits, coords, h, _ = model(x, warmup)
-        loss, type_loss, coord_loss, coord_num = compute_loss(
-            logits, coords, type_label, coord_label, coord_w, class_weights
+        logits, coords, h, _, heat = model(x, warmup, return_heat=True)
+        loss, type_loss, coord_loss, heat_loss, coord_num = compute_loss(
+            logits, coords, type_label, coord_label, coord_w, class_weights,
+            heat=heat, heat_w=heat_w, heat_sigma=heat_sigma,
         )
 
         bs = x.size(0) # batch_size可能不同，每个样本帧数必定相同
         total_type_loss += type_loss.detach() * bs
         total_coord_loss += coord_loss.detach() * coord_num
+        total_heat_loss += heat_loss.detach() * coord_num
         epoch_size += bs
         total_coord_num += coord_num
 
@@ -130,16 +170,18 @@ def evaluate(
 
     type_loss_t = total_type_loss / max(1, epoch_size)
     coord_loss_t = total_coord_loss / total_coord_num.clamp(min=1)
-    loss_t = type_loss_t + coord_w * coord_loss_t
+    heat_loss_t = total_heat_loss / total_coord_num.clamp(min=1)
+    loss_t = type_loss_t + coord_w * coord_loss_t + heat_w * heat_loss_t
     acc_t = total_correct / total_slots if total_slots else total_correct * 0.0
     coord_mae_t = total_coord_err / total_active_coords.clamp(min=1)
-    loss, type_loss, coord_loss, acc, coord_mae = torch.stack(
-        [loss_t, type_loss_t, coord_loss_t, acc_t, coord_mae_t]
+    loss, type_loss, coord_loss, heat_loss, acc, coord_mae = torch.stack(
+        [loss_t, type_loss_t, coord_loss_t, heat_loss_t, acc_t, coord_mae_t]
     ).tolist()
     metrics = {
         "loss": loss,
         "type_loss": type_loss,
         "coord_loss": coord_loss,
+        "heat_loss": heat_loss,
         "acc": acc,
         "coord_mae": coord_mae,
     }
@@ -148,6 +190,7 @@ def evaluate(
         f" average_loss = {metrics['loss']:.4f}"
         f" type_loss={metrics['type_loss']:.4f}"
         f" coord_loss={metrics['coord_loss']:.4f}"
+        f" heat_loss={metrics['heat_loss']:.4f}"
         f" acc={metrics['acc']:.4f}"
         f" coord_mae={metrics['coord_mae']:.4f}"
     )
@@ -162,6 +205,8 @@ def train_chunks(
     lr: float = 1e-3,
     lr_min_ratio: float = 0.05,   # 余弦退火终点 lr = lr * lr_min_ratio
     coord_w: float = C.coord_w,
+    heat_w: float = C.heat_w,
+    heat_sigma: float = C.heat_sigma,
     device: str = C.device,
     save_dir: str = C.save_dir,
     log_interval: int = 20,
@@ -179,11 +224,16 @@ def train_chunks(
     save_path.mkdir(parents=True, exist_ok=True)
     log_file = save_path / "train_log.csv"
     log_header = [
-        "epoch", "train_loss", "train_type_loss", "train_coord_loss",
-        "val_loss", "val_type_loss", "val_coord_loss", "val_acc", "val_coord_mae",
+        "epoch", "train_loss", "train_type_loss", "train_coord_loss", "train_heat_loss",
+        "val_loss", "val_type_loss", "val_coord_loss", "val_heat_loss", "val_acc", "val_coord_mae",
         "is_best", "lr",
     ]
     log_is_new = not log_file.exists() or log_file.stat().st_size == 0
+    has_heat_cols = True
+    if not log_is_new:
+        with log_file.open("r", encoding="utf-8") as rf:
+            first_line = rf.readline()
+            has_heat_cols = "train_heat_loss" in first_line
     log_f = log_file.open("a", encoding="utf-8", newline="")
     writer = csv.writer(log_f)
     if log_is_new:
@@ -196,6 +246,7 @@ def train_chunks(
         step_idx = 0
         total_type_loss = torch.zeros((), device=device)
         total_coord_loss = torch.zeros((), device=device)
+        total_heat_loss = torch.zeros((), device=device)
         epoch_size = 0
         total_coord_num = torch.zeros((), dtype=torch.long, device=device)
         for warmup, x, type_label, coord_label in train_loader:
@@ -209,8 +260,11 @@ def train_chunks(
             type_label = type_label.to(device, non_blocking = True)
             coord_label = coord_label.to(device, non_blocking = True)
 
-            logits, coords, h, _ = model(x, warmup)
-            loss, type_loss, coord_loss, coord_num = compute_loss(logits, coords, type_label, coord_label, coord_w, class_weights)
+            logits, coords, h, _, heat = model(x, warmup, return_heat=True)
+            loss, type_loss, coord_loss, heat_loss, coord_num = compute_loss(
+                logits, coords, type_label, coord_label, coord_w, class_weights,
+                heat=heat, heat_w=heat_w, heat_sigma=heat_sigma,
+            )
 
             opt.zero_grad()
             loss.backward()
@@ -219,27 +273,32 @@ def train_chunks(
             bs = x.size(0) # batch_size可能不同，每个样本帧数必定相同
             total_type_loss += type_loss.detach() * bs
             total_coord_loss += coord_loss.detach() * coord_num
+            total_heat_loss += heat_loss.detach() * coord_num
             total_coord_num += coord_num
             epoch_size += bs
 
             if log_interval > 0 and step_idx % log_interval == 0:
-                avg_type_loss, avg_coord_loss = torch.stack([
+                avg_type_loss, avg_coord_loss, avg_heat_loss = torch.stack([
                     total_type_loss / max(1, epoch_size),
                     total_coord_loss / total_coord_num.clamp(min=1),
+                    total_heat_loss / total_coord_num.clamp(min=1),
                 ]).tolist()
-                avg_loss = avg_type_loss + coord_w * avg_coord_loss
+                avg_loss = avg_type_loss + coord_w * avg_coord_loss + heat_w * avg_heat_loss
                 print(
                     f"  [Epoch {i:03d} | Step {step_idx:04d}/{len(train_loader):04d}] "
-                    f"  loss={avg_loss:.4f} type_loss={avg_type_loss:.4f} coord_loss={avg_coord_loss:.4f}"
+                    f"  loss={avg_loss:.4f} type_loss={avg_type_loss:.4f} "
+                    f"coord_loss={avg_coord_loss:.4f} heat_loss={avg_heat_loss:.4f}"
                 )
-        avg_type_loss, avg_coord_loss = torch.stack([
+        avg_type_loss, avg_coord_loss, avg_heat_loss = torch.stack([
             total_type_loss / max(1, epoch_size),
             total_coord_loss / total_coord_num.clamp(min=1),
+            total_heat_loss / total_coord_num.clamp(min=1),
         ]).tolist()
-        avg_loss = avg_type_loss + coord_w * avg_coord_loss
+        avg_loss = avg_type_loss + coord_w * avg_coord_loss + heat_w * avg_heat_loss
         print(
             f" [Epoch {i:03d} / {epochs:03d}]"
-            f" average_loss = {avg_loss:.4f} type_loss={avg_type_loss:.4f} coord_loss={avg_coord_loss:.4f}"
+            f" average_loss = {avg_loss:.4f} type_loss={avg_type_loss:.4f}"
+            f" coord_loss={avg_coord_loss:.4f} heat_loss={avg_heat_loss:.4f}"
             f" lr={lr_now:.2e}"
         )
         scheduler.step()   # 本轮 opt.step 全部完成后更新学习率
@@ -252,7 +311,8 @@ def train_chunks(
         is_best = False
         if val_loader is not None:
             metrics = evaluate(
-                model, val_loader, coord_w, device, class_weights
+                model, val_loader, coord_w, device, class_weights,
+                heat_w=heat_w, heat_sigma=heat_sigma,
             )
             if metrics["loss"] < best_val_loss:
                 best_val_loss = metrics["loss"]
@@ -266,13 +326,15 @@ def train_chunks(
 
         # 每轮结束把 train/val 指标写入 CSV 日志
         row: list[object] = [i, avg_loss, avg_type_loss, avg_coord_loss]
+        if has_heat_cols:
+            row.append(avg_heat_loss)
         if metrics is not None:
-            row += [
-                metrics["loss"], metrics["type_loss"], metrics["coord_loss"],
-                metrics["acc"], metrics["coord_mae"],
-            ]
+            row += [metrics["loss"], metrics["type_loss"], metrics["coord_loss"]]
+            if has_heat_cols:
+                row.append(metrics["heat_loss"])
+            row += [metrics["acc"], metrics["coord_mae"]]
         else:
-            row += ["", "", "", "", ""]
+            row += ["", "", "", "", "", ""] if has_heat_cols else ["", "", "", "", ""]
         row.append(int(is_best))
         row.append(lr_now)
         writer.writerow(row)
@@ -448,6 +510,8 @@ def main() -> None:
         epochs = C.epochs,
         lr = C.lr,
         coord_w = C.coord_w,
+        heat_w = C.heat_w,
+        heat_sigma = C.heat_sigma,
         device = C.device,
         save_dir=C.save_dir,
         log_interval=C.log_interval,
