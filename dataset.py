@@ -45,6 +45,12 @@ class Frame_teacher:
     def isOverSlot(self) -> bool:
         return len(self.slot) > C.n_slot
 
+    def isDad(self):
+        for item in self.slot:
+            if abs(item.x) > 0.85 or abs(item.y) > 0.85:
+                return True
+        return False
+
     def getSlot(self) -> int:
         return len(self.slot)
 
@@ -70,6 +76,7 @@ def count_max_slot(
     end = min(end, len(label))
     for i in range(start, end):
         max_slot = max(max_slot, label[i].getSlot())
+        if label[i].isDad(): return 65535
     return max_slot
 
 
@@ -98,14 +105,10 @@ def parse_finger_jsonl(
         if i in record:
             events: list[dict[str, Any]] = record[i].get("events", [])
             for e in events:
-                if e.get("bad"):
-                    continue
                 x = float(e["x"])
                 y = float(e["y"])
                 slot_label = Coordf_with_type(jsonPhase_to_ActionType(e["phase"]), x, y)
                 if not (math.isfinite(x) and math.isfinite(y)):
-                    continue
-                if abs(x) > 1.0 or abs(y) > 1.0:
                     continue
                 frame_label.slot.append(slot_label)
             # 逐帧规范排序：同一幅画面的标签唯一确定
